@@ -330,6 +330,9 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         # TODO: channel, gw, gd
+        elif m is CAM:
+            c1, c2 = ch[f], (ch[f] * 3 if args[0] == 'concat' else ch[f])
+            args = [c1, args[0]]
         elif m in {Detect, Segment}:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
