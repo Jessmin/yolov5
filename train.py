@@ -65,12 +65,78 @@ from utils.metrics import fitness
 from utils.plots import plot_evolve
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
+from prune import *
 
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
 GIT_INFO = check_git_info()
 
+def compress(model, dataloader, args):
+    """
+    the implementation of model compression. Currently correlation, l1, l2 algorithms are supported.
+    :param model: the model to be compressed
+    :param dataloader: the dataset for the evaluation of the model performance
+    :param args: the compression argument dictionary
+    :return: the pruned model
+    """
+    compress_savedir = 'runs/train/exp6' + '/compression'
+    model_name = "yolov5s"
+    dataset_name = "coco128-obs"
+    compression_body = "global"
+    compresion_method = "l1"
+    round = 0
+    topk = 1.0
+    exp = False
+    part =  [f'model.{i}.' for i in range(24)]
+    imgsz = args.imgsz
+
+    if not os.path.exists(compress_savedir):
+        os.makedirs(compress_savedir)
+    model_path = os.path.join(compress_savedir, f'pruned_{model_name}_{imgsz}_{compression_body}_{dataset_name}_r{round}.pkl')
+
+    if os.path.exists(model_path):
+        pruned_model = torch.load(model_path)
+    else:
+        LOGGER.info('Start Pruning...')
+
+        '''Initialize the sensitivity computation of the model'''
+        args.initial_rate = 0.05
+        args.rate_slope = 0
+        args.thres_slope = 0
+        
+        sens = Sensitivity(.05, .95, 19, compresion_method, round, exp, topk, args, LOGGER)
+        sen_dict = sens(model, dataloader, part)
+        LOGGER.info('sensitivity:' + str(sen_dict))
+        rate = sens.get_ratio(sen_dict)
+        LOGGER.info('rate: ' + str(rate))
+        pruned_model = deepcopy(model)
+        strategy = tp.strategy.L1Strategy() if compresion_method == 'l1' else tp.strategy.L2Strategy()
+        DG = DependencyGraph()
+        DG.build_dependency(pruned_model, example_inputs=torch.randn(1, 3, imgsz, imgsz))
+
+        start_time = time.time()
+        for i, k in enumerate(rate.keys()):
+            if 'group' in k:
+                group_id = int(k[5:])
+                group = sens.groups[group_id - 1]
+                to_prune_list = group_l1prune(pruned_model, group, rate[k], round_to=1)
+                layers = eval(
+                    f'pruned_model.module.{group[0]} if hasattr(pruned_model, "module") else pruned_model.{group[0]}')
+            else:
+                layers = eval(f'pruned_model.module.{k} if hasattr(pruned_model, "module") else pruned_model.{k}')
+                to_prune_list = strategy(layers.weight, amount=rate[k], round_to=1)
+            if isinstance(layers, torch.nn.Conv2d):
+                prune_m = tp.prune_conv
+            pruning_plan = DG.get_pruning_plan(layers, prune_m, idxs=to_prune_list)
+            pruning_plan.exec()
+
+        LOGGER.info(f'prune duration: {time.time() - start_time}')
+        torch.save(pruned_model, os.path.join(compress_savedir,
+                                              f'pruned_{model_name}_{imgsz}_{compression_body}_{dataset_name}_r{round}.pkl'))
+        del sens, sen_dict
+        gc.collect()
+    return pruned_model
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
@@ -136,15 +202,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     amp = check_amp(model)  # check AMP
-
-    # Freeze
-    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-        if any(x in k for x in freeze):
-            LOGGER.info(f'freezing {k}')
-            v.requires_grad = False
+    
+    
+    
 
     # Image size
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -155,41 +215,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({'batch_size': batch_size})
 
-    # Optimizer
-    nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
-    hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'])
-
-    # Scheduler
-    if opt.cos_lr:
-        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
-    else:
-        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
-
-    # EMA
-    ema = ModelEMA(model) if RANK in {-1, 0} else None
-
-    # Resume
-    best_fitness, start_epoch = 0.0, 0
-    if pretrained:
-        if resume:
-            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
-        del ckpt, csd
-
-    # DP mode
-    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
-        LOGGER.warning(
-            'WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
-            'See Multi-GPU Tutorial at https://docs.ultralytics.com/yolov5/tutorials/multi_gpu_training to get started.'
-        )
-        model = torch.nn.DataParallel(model)
-
-    # SyncBatchNorm
-    if opt.sync_bn and cuda and RANK != -1:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
-        LOGGER.info('Using SyncBatchNorm()')
+    
 
     # Trainloader
     train_loader, dataset = create_dataloader(train_path,
@@ -233,11 +259,57 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             model.half().float()  # pre-reduce anchor precision
 
         callbacks.run('on_pretrain_routine_end', labels, names)
-
+        
+    model = compress(model, val_loader if RANK in [-1, 0] else None, opt)
+    model = model.to(device)
+    
+    # Freeze
+    freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
+    for k, v in model.named_parameters():
+        v.requires_grad = True  # train all layers
+        # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
+        if any(x in k for x in freeze):
+            LOGGER.info(f'freezing {k}')
+            v.requires_grad = False
+            
     # DDP mode
     if cuda and RANK != -1:
         model = smart_DDP(model)
+    # Optimizer
+    nbs = 64  # nominal batch size
+    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
+    hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
+    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'])
 
+    # Scheduler
+    if opt.cos_lr:
+        lf = one_cycle(1, hyp['lrf'], epochs)  # cosine 1->hyp['lrf']
+    else:
+        lf = lambda x: (1 - x / epochs) * (1.0 - hyp['lrf']) + hyp['lrf']  # linear
+    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)  # plot_lr_scheduler(optimizer, scheduler, epochs)
+
+    # EMA
+    ema = ModelEMA(model) if RANK in {-1, 0} else None
+
+    # Resume
+    best_fitness, start_epoch = 0.0, 0
+    if pretrained:
+        if resume:
+            best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
+        del ckpt, csd
+
+    # DP mode
+    if cuda and RANK == -1 and torch.cuda.device_count() > 1:
+        LOGGER.warning(
+            'WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results.\n'
+            'See Multi-GPU Tutorial at https://docs.ultralytics.com/yolov5/tutorials/multi_gpu_training to get started.'
+        )
+        model = torch.nn.DataParallel(model)
+
+    # SyncBatchNorm
+    if opt.sync_bn and cuda and RANK != -1:
+        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
+        LOGGER.info('Using SyncBatchNorm()')
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
     hyp['box'] *= 3 / nl  # scale to layers

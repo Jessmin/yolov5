@@ -148,7 +148,7 @@ class BaseModel(nn.Module):
         return self
 
     def info(self, verbose=False, img_size=640):  # print model information
-        model_info(self, verbose, img_size)
+        return model_info(self, verbose, img_size)
 
     def _apply(self, fn):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
