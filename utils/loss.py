@@ -293,7 +293,7 @@ class ComputeLossOTA:
                     lbox += (1.0 - iou).mean()  # iou loss
 
                 # Objectness
-                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+                tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().squeeze().clamp(0).type(tobj.dtype)  # iou ratio
 
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
